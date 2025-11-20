@@ -1,0 +1,322 @@
+# --------------------------------------------------------------
+#  lora_unlearn_chase.py
+#  LoRA + KD + Background-forget Unlearning for CHASE_DB1
+#  Uses trained teacher from chase_teacher_full.pth (set path below)
+#  TRAIN (on train set only) + EVAL (Retain / Forget / Val)
+# --------------------------------------------------------------
+
+import os
+import random
+import copy
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+import segmentation_models_pytorch as smp
+from peft import LoraConfig, get_peft_model
+
+# ---------------- CONFIG ----------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# CHASE_DB1 split dirs
+train_img_dir = r"D:\CHASE_DB1_SPLIT\train\images"
+train_mask_dir = r"D:\CHASE_DB1_SPLIT\train\masks_2nd"
+
+val_img_dir = r"D:\CHASE_DB1_SPLIT\val\images"
+val_mask_dir = r"D:\CHASE_DB1_SPLIT\val\masks_2nd"
+
+# TODO: set this to your actual teacher checkpoint from train_db_teacher.py
+TEACHER_CKPT = r"isic_teacher_full_db2nd.pth"
+
+forget_ratio = 0.10      # 10% of train as forget set
+batch_size   = 4         # CHASE is small, keep this modest
+num_epochs   = 80
+lr           = 1e-4
+T            = 2.0
+alpha        = 1.0       # KD weight on retain
+beta_guard   = 0.05      # guard MSE weight on retain
+lambda_forget = 3.0      # weight for forget loss (stronger forgetting)
+
+LORA_R        = 8
+LORA_ALPHA    = 32
+LORA_DROPOUT  = 0.05
+
+
+def set_seed(s=0):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ---------------- Dataset (CHASE_DB1) ----------------
+class ChaseDataset(Dataset):
+    """
+    Expects:
+      img_dir:  ...\\train\\images   (Image_01L.jpg)
+      mask_dir: ...\\train\\masks_1st (Image_01L_1stHO.png)
+    Same for val.
+    """
+    def __init__(self, img_dir, mask_dir, transform=None):
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+
+        self.images = sorted([
+            f for f in os.listdir(img_dir)
+            if f.lower().endswith((".jpg", ".png", ".jpeg"))
+        ])
+
+        if len(self.images) == 0:
+            raise RuntimeError(f"No images found in {img_dir}")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_name = self.images[idx]                      # e.g. "Image_01L.jpg"
+        img_path = os.path.join(self.img_dir, img_name)
+
+        base = os.path.splitext(img_name)[0]            # "Image_01L"
+        mask_name = base + "_2ndHO.png"                 # "Image_01L_1stHO.png"
+        mask_path = os.path.join(self.mask_dir, mask_name)
+
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"Mask not found: {mask_path}")
+
+        image = np.array(Image.open(img_path).convert("RGB"))
+        mask = (np.array(Image.open(mask_path).convert("L")) > 127).astype(np.float32)
+
+        if self.transform is not None:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]                  # [3, H, W]
+            mask = augmented["mask"]                    # [H, W]
+        else:
+            image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+            mask = torch.from_numpy(mask).float()
+
+        # Ensure mask has shape [1, H, W]
+        if isinstance(mask, np.ndarray):
+            mask = torch.from_numpy(mask)
+
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)                    # [1, H, W]
+        elif mask.ndim == 3 and mask.shape[0] != 1 and mask.shape[-1] == 1:
+            mask = mask.permute(2, 0, 1)
+
+        mask = mask.contiguous().float()
+        return image, mask
+
+
+transform = A.Compose([
+    A.Resize(height=256, width=256),
+    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ToTensorV2()
+])
+
+
+# ---------------- Metrics ----------------
+def dice_iou_from_logits(logits, masks, thresh=0.5, eps=1e-7):
+    probs = torch.sigmoid(logits)
+    preds = (probs > thresh).float()
+
+    preds = preds.view(preds.size(0), -1)
+    masks = masks.view(masks.size(0), -1)
+
+    intersection = (preds * masks).sum(dim=1)
+    pred_sum = preds.sum(dim=1)
+    mask_sum = masks.sum(dim=1)
+
+    dice = (2 * intersection + eps) / (pred_sum + mask_sum + eps)
+    iou  = (intersection + eps) / (pred_sum + mask_sum - intersection + eps)
+
+    return dice.mean().item(), iou.mean().item()
+
+
+def evaluate_model(model, loader, name, device, thresh=0.5):
+    model.eval()
+    dices, ious = [], []
+
+    with torch.no_grad():
+        for imgs, masks in loader:
+            imgs = imgs.to(device, non_blocking=True).float()
+            masks = masks.to(device, non_blocking=True).float()
+            logits = model(imgs)
+            d, i = dice_iou_from_logits(logits, masks, thresh=thresh)
+            dices.append(d)
+            ious.append(i)
+
+    dice_mean = float(np.mean(dices)) if dices else 0.0
+    iou_mean  = float(np.mean(ious)) if ious else 0.0
+
+    print(f"[{name}] Dice={dice_mean:.4f} | IoU={iou_mean:.4f}")
+    model.train()
+    return dice_mean, iou_mean
+
+
+def build_unet():
+    # Must match your teacher architecture from train_db_teacher.py
+    return smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights=None,
+        classes=1,
+        activation=None
+    )
+
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    set_seed(0)
+
+    # 1. Train dataset -> split retain/forget
+    train_ds = ChaseDataset(train_img_dir, train_mask_dir, transform=transform)
+    total = len(train_ds)
+    forget_sz = max(1, int(forget_ratio * total))  # at least 1 sample to forget
+    retain_sz = total - forget_sz
+
+    retain_ds, forget_ds = random_split(
+        train_ds,
+        [retain_sz, forget_sz],
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    retain_loader = DataLoader(retain_ds, batch_size=batch_size,
+                               shuffle=True, num_workers=0, pin_memory=True)
+    forget_loader = DataLoader(forget_ds, batch_size=batch_size,
+                               shuffle=True, num_workers=0, pin_memory=True)
+
+    retain_eval_loader = DataLoader(retain_ds, batch_size=batch_size,
+                                    shuffle=False, num_workers=0, pin_memory=True)
+    forget_eval_loader = DataLoader(forget_ds, batch_size=batch_size,
+                                    shuffle=False, num_workers=0, pin_memory=True)
+
+    # 2. Separate validation dataset & loader
+    val_ds = ChaseDataset(val_img_dir, val_mask_dir, transform=transform)
+    val_eval_loader = DataLoader(val_ds, batch_size=batch_size,
+                                 shuffle=False, num_workers=0, pin_memory=True)
+
+    print(f"Train total: {total} | Retain: {retain_sz} | Forget: {forget_sz}")
+    print(f"Val size: {len(val_ds)}")
+
+    # 3. Load teacher
+    teacher = build_unet().to(device)
+    print(f"Loading TEACHER from: {TEACHER_CKPT}")
+    teacher_ckpt = torch.load(TEACHER_CKPT, map_location=device)
+    teacher.load_state_dict(teacher_ckpt)
+    teacher.eval()
+
+    # 4. Build student as copy + LoRA
+    base_student = build_unet().to(device)
+    base_student.load_state_dict(teacher_ckpt)
+
+    conv_names = [
+        name for name, module in base_student.named_modules()
+        if isinstance(module, torch.nn.Conv2d)
+    ]
+
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        target_modules=conv_names,
+        lora_dropout=LORA_DROPOUT,
+        bias="none"
+    )
+    student = get_peft_model(base_student, lora_config).to(device)
+    student.print_trainable_parameters()
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, student.parameters()),
+        lr=lr
+    )
+
+    dice_loss = smp.losses.DiceLoss(mode="binary")
+    bce_loss  = smp.losses.SoftBCEWithLogitsLoss()
+
+    def seg_loss(pred, true):
+        # Ensure masks are [B, 1, H, W]
+        if true.dim() == 3:          # [B, H, W]
+            true = true.unsqueeze(1)
+        return dice_loss(pred, true) + bce_loss(pred, true)
+
+    # 5. Baseline teacher metrics
+    print("\n=== Baseline TEACHER Performance (before unlearning) ===")
+    evaluate_model(teacher, retain_eval_loader, "Teacher / Retain (Train)", device)
+    evaluate_model(teacher, forget_eval_loader, "Teacher / Forget (Train)", device)
+    evaluate_model(teacher, val_eval_loader,    "Teacher / Val", device)
+
+    # 6. Unlearning
+    print("\n=== Training STUDENT (LoRA) with Retain + BG Forget (weighted) ===")
+    student.train()
+    for epoch in range(1, num_epochs + 1):
+        epoch_loss = 0.0
+        retain_steps = 0
+
+        # ---------- Retain phase: Seg + KD + Guard ----------
+        for imgs, masks in retain_loader:
+            imgs = imgs.to(device, non_blocking=True).float()
+            masks = masks.to(device, non_blocking=True).float()
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                teacher_logits = teacher(imgs)
+            student_logits = student(imgs)
+
+            # Segmentation loss
+            loss_seg = seg_loss(student_logits, masks)
+
+            # KD loss
+            soft_teacher = torch.sigmoid(teacher_logits / T).detach()
+            kd = F.binary_cross_entropy_with_logits(
+                student_logits / T, soft_teacher
+            ) * (T ** 2)
+
+            # Guard loss: keep student logits close to teacher logits
+            guard = F.mse_loss(student_logits, teacher_logits)
+
+            loss = loss_seg + alpha * kd + beta_guard * guard
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            retain_steps += 1
+
+        # ---------- Forget phase: force all-background (weighted) ----------
+        for imgs, _ in forget_loader:
+            imgs = imgs.to(device, non_blocking=True).float()
+
+            optimizer.zero_grad(set_to_none=True)
+            student_logits = student(imgs)
+
+            # All-background target (forget vessel information)
+            bg_target = torch.zeros_like(student_logits)
+            loss_forget = bce_loss(student_logits, bg_target)
+
+            (lambda_forget * loss_forget).backward()
+            optimizer.step()
+
+        avg_loss = epoch_loss / max(retain_steps, 1)
+        print(
+            f"Epoch {epoch}/{num_epochs} | "
+            f"Retain Loss={avg_loss:.4f} | "
+            f"(lambda_forget={lambda_forget}, beta_guard={beta_guard})"
+        )
+
+    # 7. Metrics after unlearning
+    print("\n=== STUDENT Performance After Unlearning ===")
+    evaluate_model(student, retain_eval_loader, "Student / Retain (Train)", device)
+    evaluate_model(student, forget_eval_loader, "Student / Forget (Train)", device)
+    evaluate_model(student, val_eval_loader,    "Student / Val", device)
+
+    # 8. Save LoRA weights
+    save_path = "chase_unlearned_lora_bgforget2nd.pth"
+    torch.save(student.state_dict(), save_path)
+    print(f"\nUnlearned LoRA model saved to: {save_path}")
